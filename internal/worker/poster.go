@@ -83,6 +83,9 @@ type Poster struct {
 	// Info and returns nil. This prevents duplicate posts when multiple
 	// instances run against the same database.
 	Lock postLocker
+
+	// sleep overrides waiting for the RPC to catch up; nil means time.Sleep.
+	sleep func(time.Duration)
 }
 
 // errSupplyDisagreement stops a post when two Horizons report different totals
@@ -90,6 +93,21 @@ type Poster struct {
 // asserts on its own authority, so a second source disagreeing about it is
 // reason to publish nothing rather than pick a side.
 var errSupplyDisagreement = errors.New("horizons disagree about supply at the same ledger")
+
+// errSupplyLedgerAhead means Horizon served balances at a ledger the RPC has not
+// reached yet. The snapshot cannot be labelled honestly this tick: the contract
+// rejects a ledger from the future, and relabelling the breakdown to the RPC's
+// head would publish balances under a ledger they were not read at, changing
+// the hash everyone recomputes against.
+var errSupplyLedgerAhead = errors.New("horizon supply is ahead of the rpc ledger")
+
+// ledgerWaitAttempts and ledgerWaitInterval bound how long a post waits for the
+// RPC to catch up to the ledger Horizon served the balances at. A Soroban RPC
+// usually trails Horizon by a ledger or two.
+const (
+	ledgerWaitAttempts = 4
+	ledgerWaitInterval = 2 * time.Second
+)
 
 // crossCheck compares a breakdown against the second Horizon.
 //
@@ -179,13 +197,16 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		return err
 	}
 
-	// Get the chain head early: a zero breakdown has no ledger from Horizon,
-	// and the staleness guard and the contract's ledger check both need it.
-	rpcLatest, err := p.RPC.GetLatestLedger(ctx)
-	if err != nil {
-		return fmt.Errorf("getLatestLedger: %w", err)
-	}
-	if b.Ledger == 0 || b.Ledger > rpcLatest.Sequence {
+	// The ledger in the breakdown is the one Horizon read the balances at. It
+	// is never rewritten to the RPC's head: that would label one ledger's
+	// balances with another's number, and the label is hashed and posted on
+	// chain. A zero breakdown has no balances to label, so it takes the chain
+	// head explicitly instead.
+	if zeroSupply {
+		rpcLatest, err := p.RPC.GetLatestLedger(ctx)
+		if err != nil {
+			return fmt.Errorf("getLatestLedger: %w", err)
+		}
 		b.Ledger = rpcLatest.Sequence
 	}
 
@@ -208,6 +229,15 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 		}
 		if b.Ledger <= last.Ledger {
 			return nil // chain has not advanced past the posted snapshot yet.
+		}
+	}
+
+	// The snapshot is about to be signed, so the chain has to have reached the
+	// ledger it is labelled with. This waits for the RPC rather than rewriting
+	// the label.
+	if !zeroSupply {
+		if err := p.waitForLedger(ctx, b.Ledger); err != nil {
+			return err
 		}
 	}
 
@@ -247,6 +277,37 @@ func (p *Poster) postOne(ctx context.Context, sac, code, issuer string) error {
 	}
 	p.Log.Info("posted supply", "code", code, "amount", b.Total, "at_ledger", b.Ledger, "tx", res.TxHash)
 	return nil
+}
+
+// waitForLedger blocks until the RPC's latest ledger is at least want, up to
+// ledgerWaitAttempts tries. Horizon can be a little ahead of the RPC, so a
+// short wait usually resolves the skew without touching the snapshot's label.
+func (p *Poster) waitForLedger(ctx context.Context, want uint32) error {
+	var latest uint32
+	for attempt := 1; ; attempt++ {
+		resp, err := p.RPC.GetLatestLedger(ctx)
+		if err != nil {
+			return fmt.Errorf("getLatestLedger: %w", err)
+		}
+		latest = resp.Sequence
+		if latest >= want {
+			return nil
+		}
+		if attempt == ledgerWaitAttempts {
+			return fmt.Errorf("rpc at ledger %d, supply read at ledger %d: %w",
+				latest, want, errSupplyLedgerAhead)
+		}
+		p.pause(ledgerWaitInterval)
+	}
+}
+
+// pause sleeps between RPC polls, and is a field so tests do not wait.
+func (p *Poster) pause(d time.Duration) {
+	if p.sleep != nil {
+		p.sleep(d)
+		return
+	}
+	time.Sleep(d)
 }
 
 // checkBalance logs a warning when the poster account's XLM balance is below

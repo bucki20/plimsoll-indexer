@@ -12,12 +12,22 @@ import (
 	"math/big"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // ErrAssetNotFound means Horizon has no record of the asset (no trustlines yet).
 var ErrAssetNotFound = errors.New("asset not found on horizon")
+
+// ErrLedgerMoved means Horizon advanced while a supply was being read and the
+// read could not be attributed to a single ledger, so no honest label exists
+// for the balances.
+var ErrLedgerMoved = errors.New("horizon ledger advanced while supply was read")
+
+// assetsLedgerAttempts is how many times Supply re-reads /assets when it
+// cannot pin the ledger the balances were served at.
+const assetsLedgerAttempts = 3
 
 // Breakdown is the per-bucket supply. Its canonical JSON encoding is hashed
 // and the hash is posted on-chain with the total, so anyone can recompute it.
@@ -124,27 +134,90 @@ func (c *Client) NativeBalance(ctx context.Context, address string) (int64, erro
 	return 0, nil
 }
 
+// assetPage is the slice of Horizon's /assets response this package reads.
+type assetPage struct {
+	Embedded struct {
+		Records []AssetRecord `json:"records"`
+	} `json:"_embedded"`
+}
+
 // Supply fetches the asset record and sums every bucket that is a claim on
 // the issuer: trustline balances in all authorization states, claimable
 // balances, liquidity-pool reserves and balances held by contracts.
+//
+// The Breakdown.Ledger it returns is the ledger the balances were actually read
+// at, never one inferred from a separate call: Horizon stamps /assets responses
+// with the Latest-Ledger header, and that is the ledger the response reflects.
+// The ledger is part of the hashed breakdown and goes on-chain, so labelling a
+// read with a made-up number would break every recomputation at that ledger.
+// When the header is missing (an older Horizon, or a proxy that strips it) the
+// read is bracketed by two root queries and retried until they agree; if they
+// never agree, ErrLedgerMoved is returned rather than a mislabelled breakdown.
 func (c *Client) Supply(ctx context.Context, code, issuer string) (Breakdown, error) {
-	ledger, err := c.LatestLedger(ctx)
+	q := url.Values{"asset_code": {code}, "asset_issuer": {issuer}}.Encode()
+	for attempt := 1; attempt <= assetsLedgerAttempts; attempt++ {
+		hdr, page, err := c.assets(ctx, q, code, issuer)
+		if err != nil {
+			return Breakdown{}, err
+		}
+		if ledger, ok := latestLedgerHeader(hdr); ok {
+			return breakdownFromPage(code+":"+issuer, ledger, page)
+		}
+
+		// No Latest-Ledger: pin the ledger by watching the root across the read.
+		before, err := c.LatestLedger(ctx)
+		if err != nil {
+			return Breakdown{}, err
+		}
+		hdr, page, err = c.assets(ctx, q, code, issuer)
+		if err != nil {
+			return Breakdown{}, err
+		}
+		if ledger, ok := latestLedgerHeader(hdr); ok {
+			return breakdownFromPage(code+":"+issuer, ledger, page)
+		}
+		after, err := c.LatestLedger(ctx)
+		if err != nil {
+			return Breakdown{}, err
+		}
+		if before == after {
+			return breakdownFromPage(code+":"+issuer, before, page)
+		}
+	}
+	return Breakdown{}, fmt.Errorf("horizon assets %s:%s: ledgers %d attempts in a row: %w",
+		code, issuer, assetsLedgerAttempts, ErrLedgerMoved)
+}
+
+// assets performs the /assets request and returns the response headers so the
+// caller can read Horizon's Latest-Ledger stamp.
+func (c *Client) assets(ctx context.Context, query, code, issuer string) (http.Header, assetPage, error) {
+	var page assetPage
+	hdr, err := c.getWithHeaders(ctx, "/assets?"+query, &page)
 	if err != nil {
-		return Breakdown{}, err
+		return nil, assetPage{}, fmt.Errorf("horizon assets %s:%s: %w", code, issuer, err)
 	}
-	q := url.Values{"asset_code": {code}, "asset_issuer": {issuer}}
-	var page struct {
-		Embedded struct {
-			Records []AssetRecord `json:"records"`
-		} `json:"_embedded"`
-	}
-	if err := c.get(ctx, "/assets?"+q.Encode(), &page); err != nil {
-		return Breakdown{}, fmt.Errorf("horizon assets %s:%s: %w", code, issuer, err)
-	}
+	return hdr, page, nil
+}
+
+func breakdownFromPage(asset string, ledger uint32, page assetPage) (Breakdown, error) {
 	if len(page.Embedded.Records) == 0 {
 		return Breakdown{}, ErrAssetNotFound
 	}
-	return BreakdownFromRecord(code+":"+issuer, ledger, page.Embedded.Records[0])
+	return BreakdownFromRecord(asset, ledger, page.Embedded.Records[0])
+}
+
+// latestLedgerHeader reads Horizon's Latest-Ledger response header, which names
+// the ledger the response body was served at.
+func latestLedgerHeader(hdr http.Header) (uint32, bool) {
+	v := strings.TrimSpace(hdr.Get("Latest-Ledger"))
+	if v == "" {
+		return 0, false
+	}
+	n, err := strconv.ParseUint(v, 10, 32)
+	if err != nil || n == 0 {
+		return 0, false
+	}
+	return uint32(n), true
 }
 
 // BreakdownFromRecord converts Horizon's decimal strings to integer units.
@@ -202,21 +275,30 @@ func ParseAmount(s string) (*big.Int, error) {
 }
 
 func (c *Client) get(ctx context.Context, path string, out any) error {
+	_, err := c.getWithHeaders(ctx, path, out)
+	return err
+}
+
+// getWithHeaders is get, also returning the response headers.
+func (c *Client) getWithHeaders(ctx context.Context, path string, out any) (http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+path, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusNotFound {
-		return ErrAssetNotFound
+		return nil, ErrAssetNotFound
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status %d", resp.StatusCode)
+		return nil, fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return nil, err
+	}
+	return resp.Header, nil
 }
